@@ -1,0 +1,131 @@
+---
+- name: "Create Azure resources"
+  connection: local
+  hosts: all
+  vars_prompt:
+    - name: "location"
+      prompt: "choose region to deploy VMs (default westeurope)"
+      private: no
+      default: "westeurope"
+    - name: "project_prefix"
+      prompt: "choose a prefix for all the resources (default test)"
+      private: no
+      default: "test"
+    - name: "instances_number"
+      prompt: "choose a number of virtual machines to create (default 1)"
+      private: no
+      default: 1
+    - name: "vm_size"
+      prompt: "choose a size for azure virtual machines (default Standard_B2s)"
+      private: no
+      default: "Standard_B2s"
+    - name: "managed_disk_type"
+      prompt: "choose a type for azure virtual disks (default Standard_LRS)"
+      private: no
+      default: "Standard_LRS"
+    - name: "admin_username"
+      prompt: "choose an admin username (default admin)"
+      private: no
+      default: "admin"
+  vars:
+    - admin_username: "admin"
+    - virtualnetwork_cidr: "172.16.1.0/18"
+    - subnet_cidr: "172.16.1.0/28"
+    - resourcegroup_name: "{{project_prefix}}-rg"
+    - availabilityset_name: "{{project_prefix}}-avset"
+    - virtualnetwork_name: "{{project_prefix}}-vnet"
+    - subnet_name: "{{project_prefix}}-subnet"
+    - securitygroup_name: "{{project_prefix}}-nsg"
+    - vm_root_name: "{{project_prefix}}-vm"
+    - nic_root_name: "{{project_prefix}}-nic"
+  tasks:
+    - name: "Create {{project_prefix}}-rg Resource Group"
+      azure_rm_resourcegroup:
+        name: "{{resourcegroup_name}}"
+        location: "{{location}}"
+
+    - name: "Create {{availabilityset_name}} Availability Set"
+      azure_rm_availabilityset:
+        name: "{{availabilityset_name}}"
+        location: "{{location}}"
+        resource_group: "{{resourcegroup_name}}"
+        sku: Aligned
+
+    - name: "create {{subnet_name}} Subnet in {{virtualnetwork_name}} for VMs"
+      azure_rm_subnet:
+        name: "{{subnet_name}}"
+        virtual_network_name: "{{virtualnetwork_name}}"
+        resource_group: "{{resourcegroup_name}}"
+        address_prefix_cidr: "{{subnet_cidr}}"
+      register: subnet
+
+    - name: "Create {{securitygroup_name}} security rules"
+      azure_rm_securitygroup:
+        name: "{{securitygroup_name}}"
+        resource_group: "{{resourcegroup_name}}"
+        purge_rules: yes
+        rules:
+          - name: 'AllowSSHFromYourOwnInternetIP'
+            protocol: 'Tcp'
+            source_address_prefix: 'xxx.xxx.xxx.xxx'
+            destination_port_range: 22
+            access: Allow
+            priority: 1000
+            direction: Inbound
+          - name: 'AllowInternalVnet'
+            source_address_prefix: "{{subnet_cidr}}"
+            access: Allow
+            priority: 1010
+
+    - name: "Create a {{nic_root_name}}X network interface for each VM (in parallel using async)"
+      azure_rm_networkinterface:
+        name: "{{nic_root_name}}{{item}}"
+        resource_group: "{{resourcegroup_name}}"
+        virtual_network_name: "{{virtualnetwork_name}}"
+        virtual_network_resource_group: "{{resourcegroup_name}}"
+        subnet_name: "{{subnet_name}}"
+        security_group_name: "{{securitygroup_name}}"
+        ip_configurations:
+          - name: "ipconfig"
+            primary: True
+      with_sequence: count="{{instances_number}}"
+      register: azure_nics
+      async: 120
+      poll: 0
+    - name: "Wait for nics creation to complete"
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: azure_nics_jobs
+      until: azure_nics_jobs.finished
+      retries: 24
+      with_items: "{{ azure_nics.results }}"
+
+    - name: "Create {{vm_root_name}}X VM with existing NIC (in parallel using async)"
+      azure_rm_virtualmachine:
+        resource_group: "{{resourcegroup_name}}"
+        name: "{{vm_root_name}}{{item}}"
+        vm_size: "{{vm_size}}"
+        managed_disk_type: "{{managed_disk_type}}"
+        admin_username: "{{admin_username}}"
+        availability_set: "{{availabilityset_name}}"
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: "/home/{{admin_username}}/.ssh/authorized_keys"
+            key_data: "{{lookup('file', '{{admin_username}}.pub') }}"
+        network_interface_names: "{{nic_root_name}}{{item}}"
+        image:
+          offer: UbuntuServer
+          publisher: Canonical
+          sku: '16.04.0-LTS'
+          version: latest
+      with_sequence: count="{{instances_number}}"
+      register: azure_vms_instances
+      async: 600
+      poll: 0
+    - name: "Wait for instance creation to complete"
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: azure_vms_jobs
+      until: azure_vms_jobs.finished
+      retries: 120
+      with_items: "{{ azure_vms_instances.results }}"
