@@ -4,39 +4,53 @@
   hosts: all
   vars_prompt:
     - name: "location"
-      prompt: "choose region to deploy VMs (default westeurope)"
+      prompt: "Choose region to deploy VMs"
       private: no
       default: "westeurope"
     - name: "project_prefix"
-      prompt: "choose a prefix for all the resources (default test)"
+      prompt: "Choose a prefix for all the resources"
       private: no
       default: "test"
     - name: "instances_number"
-      prompt: "choose a number of virtual machines to create (default 1)"
+      prompt: "Choose a number of virtual machines to create"
       private: no
       default: 1
     - name: "vm_size"
-      prompt: "choose a size for azure virtual machines (default Standard_B2s)"
+      prompt: "Choose a size for azure virtual machines"
       private: no
       default: "Standard_B2s"
     - name: "managed_disk_type"
-      prompt: "choose a type for azure virtual disks (default Standard_LRS)"
+      prompt: "Choose a type for azure virtual disks"
       private: no
       default: "Standard_LRS"
     - name: "admin_username"
-      prompt: "choose an admin username (default admin)"
+      prompt: "Choose an admin username"
       private: no
-      default: "admin"
+      default: "zwindler"
+    - name: "admin_pub_path"
+      prompt: "Where can I find the admin public key ?"
+      private: no
+      default: "~/.ssh/id_rsa.pub"
+    - name: "local_ip"
+      prompt: "your local IP address (skip if you don't want to add 22 port to NSG)"
+      private: no
+      default: "skip"
+    - name: "virtualnetwork_cidr"
+      prompt: "Give a network CIDR for virtual network (large)"
+      private: no
+      default: "172.16.0.0/18"
+    - name: "subnet_cidr"
+      prompt: "Give a subnet of that network"
+      private: no
+      default: "172.16.1.0/24"
   vars:
-    - admin_username: "admin"
-    - virtualnetwork_cidr: "172.16.1.0/18"
-    - subnet_cidr: "172.16.1.0/28"
     - resourcegroup_name: "{{project_prefix}}-rg"
     - availabilityset_name: "{{project_prefix}}-avset"
     - virtualnetwork_name: "{{project_prefix}}-vnet"
     - subnet_name: "{{project_prefix}}-subnet"
     - securitygroup_name: "{{project_prefix}}-nsg"
     - vm_root_name: "{{project_prefix}}-vm"
+    - public_ip_name: "{{project_prefix}}-ip"
     - nic_root_name: "{{project_prefix}}-nic"
   tasks:
     - name: "Create {{project_prefix}}-rg Resource Group"
@@ -51,6 +65,13 @@
         resource_group: "{{resourcegroup_name}}"
         sku: Aligned
 
+    - name: "Create {{virtualnetwork_name}} Virtual Network"
+      azure_rm_virtualnetwork:
+        name: "{{virtualnetwork_name}}"
+        resource_group: "{{resourcegroup_name}}"
+        address_prefixes_cidr:
+          - "{{virtualnetwork_cidr}}"
+
     - name: "create {{subnet_name}} Subnet in {{virtualnetwork_name}} for VMs"
       azure_rm_subnet:
         name: "{{subnet_name}}"
@@ -59,7 +80,7 @@
         address_prefix_cidr: "{{subnet_cidr}}"
       register: subnet
 
-    - name: "Create {{securitygroup_name}} security rules"
+    - name: "Create {{securitygroup_name}} security rules (if local IP address was given)"
       azure_rm_securitygroup:
         name: "{{securitygroup_name}}"
         resource_group: "{{resourcegroup_name}}"
@@ -67,40 +88,27 @@
         rules:
           - name: 'AllowSSHFromYourOwnInternetIP'
             protocol: 'Tcp'
-            source_address_prefix: 'xxx.xxx.xxx.xxx'
+            source_address_prefix: "{{local_ip}}"
             destination_port_range: 22
             access: Allow
             priority: 1000
             direction: Inbound
-          - name: 'AllowInternalVnet'
-            source_address_prefix: "{{subnet_cidr}}"
-            access: Allow
-            priority: 1010
+      when: local_ip | ipaddr
 
-    - name: "Create a {{nic_root_name}}X network interface for each VM (in parallel using async)"
+    - name: "Create a {{nic_root_name}}X network interface for each VM"
       azure_rm_networkinterface:
         name: "{{nic_root_name}}{{item}}"
         resource_group: "{{resourcegroup_name}}"
-        virtual_network_name: "{{virtualnetwork_name}}"
-        virtual_network_resource_group: "{{resourcegroup_name}}"
+        virtual_network: "{{virtualnetwork_name}}"
         subnet_name: "{{subnet_name}}"
-        security_group_name: "{{securitygroup_name}}"
+        security_group: "{{securitygroup_name}}"
         ip_configurations:
           - name: "ipconfig"
+            public_ip_address_name: "{{public_ip_name}}"
             primary: True
       with_sequence: count="{{instances_number}}"
-      register: azure_nics
-      async: 120
-      poll: 0
-    - name: "Wait for nics creation to complete"
-      async_status:
-        jid: "{{ item.ansible_job_id }}"
-      register: azure_nics_jobs
-      until: azure_nics_jobs.finished
-      retries: 24
-      with_items: "{{ azure_nics.results }}"
 
-    - name: "Create {{vm_root_name}}X VM with existing NIC (in parallel using async)"
+    - name: "Create {{vm_root_name}}X VM with existing NIC"
       azure_rm_virtualmachine:
         resource_group: "{{resourcegroup_name}}"
         name: "{{vm_root_name}}{{item}}"
@@ -111,7 +119,7 @@
         ssh_password_enabled: false
         ssh_public_keys:
           - path: "/home/{{admin_username}}/.ssh/authorized_keys"
-            key_data: "{{lookup('file', '{{admin_username}}.pub') }}"
+            key_data: "{{lookup('file', '{{admin_pub_path}}') }}"
         network_interface_names: "{{nic_root_name}}{{item}}"
         image:
           offer: UbuntuServer
@@ -119,13 +127,3 @@
           sku: '16.04.0-LTS'
           version: latest
       with_sequence: count="{{instances_number}}"
-      register: azure_vms_instances
-      async: 600
-      poll: 0
-    - name: "Wait for instance creation to complete"
-      async_status:
-        jid: "{{ item.ansible_job_id }}"
-      register: azure_vms_jobs
-      until: azure_vms_jobs.finished
-      retries: 120
-      with_items: "{{ azure_vms_instances.results }}"
